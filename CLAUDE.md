@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Setup & Running
 
-Install dependencies:
+Install dependencies (use `.venv/bin/pip` — the project uses a local virtualenv):
 
 ```bash
 pip install -r requirements.txt
@@ -14,13 +14,11 @@ Requires either `ANTHROPIC_FOUNDRY_API_KEY` (Azure AI Foundry / Claude) or `OPEN
 
 **Start the API server:**
 ```bash
-python app.py               # runs uvicorn on http://0.0.0.0:8000
-# or equivalently:
-uvicorn api.main:app --reload
+.venv/bin/python app.py          # runs uvicorn on http://0.0.0.0:8000
 # Interactive docs at http://localhost:8000/docs
 ```
 
-**Run the MCP agent (connects to Dubai Holding Foundry endpoint):**
+**Run the standalone MCP agent:**
 ```bash
 python -m src.mcp.server                        # default query
 python -m src.mcp.server "your question here"   # custom query
@@ -30,35 +28,36 @@ python -m src.mcp.server "your question here"   # custom query
 
 ```
 src/
-├── config.py              # All hardcoded values (models, paths, weights)
+├── config.py              # All env vars and hardcoded constants (models, paths, weights)
 ├── llm.py                 # get_llm(tier?) + get_embeddings() factories; module-level instances
 ├── indexing/
-│   ├── loaders.py         # PDF/DOCX/XLSX/web/text document loaders
-│   ├── chunkers.py        # Semantic + recursive chunking strategies
-│   └── embeddings.py      # Dual-index creation (Chroma + BM25), persistence
+│   ├── loaders.py         # PDF/DOCX/XLSX document loaders + directory scanner
+│   ├── chunkers.py        # SemanticChunker with RecursiveCharacterTextSplitter fallback
+│   └── embeddings.py      # Chroma (dense) + BM25 (sparse) index creation and persistence
 ├── retrieval/
-│   ├── retrievers.py      # Dense, sparse, hybrid ensemble + query expansion
+│   ├── retrievers.py      # Hybrid ensemble (BM25 + MMR) + multi-query expansion
 │   └── rerankers.py       # FlashrankRerank + content-hash deduplication
 ├── augmentation/
-│   ├── graders.py         # CRAG relevance grading per chunk
-│   └── context.py         # Chunk positioning + citation context assembly
+│   ├── graders.py         # CRAG per-chunk LLM relevance grading
+│   └── context.py         # Lost-in-the-middle reordering + citation context builder
 ├── generation/
-│   ├── schemas.py         # RAGAnswer Pydantic schema
-│   └── chains.py          # GPT-4o generation + faithfulness validation chains
+│   ├── schemas.py         # RAGAnswer Pydantic model + RAG_SYSTEM prompt constant
+│   └── chains.py          # generate() with chat history + check_faithfulness()
 ├── datasources/
 │   ├── base.py            # BaseDataSource ABC
-│   ├── filesystem.py      # Wraps loaders.py for file-based sources
-│   ├── sql_server.py      # SQLAlchemy → Documents (SQL Server, Postgres, SQLite)
-│   └── web_crawler.py     # WebBaseLoader multi-URL crawler
+│   ├── filesystem.py      # File-based source (wraps loaders.py)
+│   ├── sql_server.py      # SQLAlchemy → Documents
+│   ├── web_crawler.py     # WebBaseLoader multi-URL crawler
+│   └── mcp_source.py      # async fetch_mcp_documents(query) — query-time MCP retrieval
 ├── tools/
-│   ├── web_search.py      # Tavily (if key set) or DuckDuckGo fallback → Documents
-│   └── sql_query.py       # QuerySQLDataBaseTool / InfoSQLDatabaseTool / ListSQLDatabaseTool
+│   ├── web_search.py      # Tavily or DuckDuckGo fallback → Documents
+│   └── sql_query.py       # LangChain SQL tools (requires SQL_CONNECTION_STRING)
 ├── mcp/
-│   └── server.py          # MCP client: connects to Dubai Holding Foundry endpoint, lists tools, runs Claude agent
+│   └── server.py          # Standalone MCP client: agentic loop against Dubai Holding Foundry
 └── graph/
     ├── state.py           # RAGState TypedDict
-    ├── nodes.py           # LangGraph node functions (web_search_node uses real search)
-    ├── edges.py           # Conditional routing logic
+    ├── nodes.py           # LangGraph node factory functions
+    ├── edges.py           # Conditional routing (route_after_augment, route_after_faithfulness)
     └── builder.py         # build_rag_graph() → CompiledGraph
 
 api/
@@ -66,108 +65,111 @@ api/
 ├── dependencies.py        # get_rag_graph(), get_indexer(), require_pipeline()
 ├── routers/
 │   ├── health.py          # GET  /api/v1/health
-│   ├── query.py           # POST /api/v1/query
-│   └── index.py           # POST /api/v1/index
+│   ├── query.py           # POST /api/v1/query  (fetches MCP docs async before graph invoke)
+│   └── index.py           # POST /api/v1/index  (scans source/ only, no request body)
 └── schemas/
-    ├── requests.py        # QueryRequest, IndexRequest, DocumentSource, SQLSource, WebSource
+    ├── requests.py        # QueryRequest (query + chat_history)
     └── responses.py       # QueryResponse, IndexResponse, HealthResponse
 
-source/                    # Raw input documents (PDFs, DOCX, XLSX)
-data/rag_db/               # Persisted Chroma vector store (generated)
-tests/                     # Unit tests per pipeline stage
-notebooks/                 # Experimentation notebooks
-app.py                     # Entry point: starts FastAPI server via uvicorn
+source/                    # Raw input documents (PDFs, DOCX, XLSX) — only indexing source
+data/rag_db/               # Persisted Chroma vector store (auto-generated)
+app.py                     # Entry point: uvicorn launcher
 ```
 
 ## Architecture
 
-**Self-correcting RAG pipeline** built on LangChain + LangGraph, organized into four pipeline stages followed by a LangGraph orchestration layer.
+**Self-correcting RAG pipeline** built on LangChain + LangGraph with dual retrieval (vector store + MCP).
 
 ### Pipeline Stages
 
-1. **`IndexingPipeline`** (offline, run once) — Loads documents (PDF/web/text) → cleans → chunks using `SemanticChunker` (90th percentile breakpoint) with fallback to `RecursiveCharacterTextSplitter` (512 chars, 50 overlap) → embeds into dual indices: Chroma (dense) + BM25 (sparse), persisted to `./rag_db`.
+1. **`IndexingPipeline`** (offline) — Scans `source/` recursively → cleans → chunks via `SemanticChunker` (90th percentile breakpoint) with `RecursiveCharacterTextSplitter` fallback (512 chars, 50 overlap) → embeds into Chroma (dense) + BM25 (sparse), persisted to `data/rag_db/`.
 
-2. **`RetrievalPipeline`** (per query) — LLM expands query into 3 variants → hybrid retrieval (35% BM25 + 65% vector MMR, k=10 each) → FlashrankRerank (top 5) → content-hash deduplication → returns top 6 chunks.
+2. **`RetrievalPipeline`** (per query) — LLM expands query into 3 variants → hybrid retrieval (35% BM25 + 65% MMR, k=10 each) → FlashrankRerank (top 5) → deduplication → top 6 chunks. The `retrieve_node` **merges** pre-seeded MCP docs from state with vector results before returning.
 
-3. **`AugmentationPipeline`** (per query) — CRAG-style LLM relevance grading drops irrelevant chunks → reorders chunks best-first/best-last to counter "lost-in-the-middle" degradation → builds numbered citation context string.
+3. **`AugmentationPipeline`** (per query) — LLM grades each chunk (`"relevant"` vs `"irrelevant"` — substring check guards against `"irrelevant"` matching) → reorders best-first/best-last → builds numbered citation context.
 
-4. **`GenerationPipeline`** (per query) — LLM generates a `RAGAnswer` Pydantic struct (`answer`, `confidence`, `citations`, `caveats`) using structured output → post-hoc faithfulness check validates all claims are grounded in context.
+4. **`GenerationPipeline`** (per query) — Prepends `chat_history` as `HumanMessage`/`AIMessage` before the RAG context → generates `RAGAnswer` (structured output) → faithfulness check.
 
 ### LangGraph Orchestration (CRAG loop)
 
-`build_rag_graph()` wires these stages into a stateful graph (`RAGState` TypedDict: `query, documents, context, answer, faithful, retry_count`) with conditional routing:
+`RAGState` fields: `query`, `chat_history`, `documents`, `context`, `answer`, `faithful`, `web_search_retries`, `faith_retries`
 
-- After augment: if no context and `retry_count < 2` → `web_search` node (Tavily or DuckDuckGo)
-- After faithfulness check: if not faithful and `retry_count < 2` → back to `generate`; otherwise → END
+Two **separate** retry budgets (both default `MAX_RETRIES=2`):
+- `web_search_retries` — checked by `route_after_augment`: no context → `web_search` node
+- `faith_retries` — checked by `route_after_faithfulness`: unfaithful → back to `generate`
+
+### Query Flow (Dual Retrieval)
+
+```
+POST /api/v1/query
+  1. Router (async): fetch_mcp_documents(query)  → mcp_docs
+  2. graph.invoke(documents=mcp_docs, ...)
+       retrieve_node:  vector_docs = retrieval.retrieve(query)
+                       documents   = mcp_docs + vector_docs
+       augment_node:   grade all docs, build context
+       generate_node:  answer with chat_history + context
+       faithfulness:   validate, retry if needed
+```
+
+MCP fetch fails gracefully (returns `[]`) when `FOUNDRY_TOKEN` is unset or connection fails.
 
 ### FastAPI Layer
 
-`api/main.py` uses a **lifespan** context manager to initialize app state once on startup. Pipeline instances are stored on `app.state` and injected into route handlers via FastAPI dependencies (`api/dependencies.py`).
+`api/main.py` lifespan auto-loads `data/rag_db/` on startup and reconstructs BM25 docs from `vectorstore.get()`.
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/v1/health` | Reports `pipeline_ready` and `vector_store_exists` |
-| `POST /api/v1/index` | Indexes documents and rebuilds the RAG graph. Body fields: `sources` (file list), `sql` (SQL source), `web` (URL list) — all optional; omitting all triggers full `source/` scan |
-| `POST /api/v1/query` | Invokes the compiled LangGraph and returns a `QueryResponse` |
+| `GET /api/v1/health` | `pipeline_ready` + `vector_store_exists` |
+| `POST /api/v1/index` | No body — scans `source/` recursively, rebuilds graph |
+| `POST /api/v1/query` | `{"query": "...", "chat_history": [...]}` → `QueryResponse` |
 
-On restart, the lifespan auto-loads an existing `data/rag_db` Chroma store and reconstructs `Document` objects for BM25 from `vectorstore.get()`, so the service is immediately ready without re-indexing.
+`chat_history` format: `[{"role": "user"/"assistant", "content": "..."}]`
 
 ### LLM & Embedding Selection
 
-`src/llm.py` exposes `get_llm(tier?)` and `get_embeddings()` factories. Priority order:
-
-**LLM** — set `MODEL_TIER=sonnet|haiku|opus` in `.env`:
+**LLM** (`src/llm.py`) — `MODEL_TIER=sonnet|haiku|opus`:
 | Priority | Condition | Provider |
 |---|---|---|
 | 1 | `ANTHROPIC_FOUNDRY_API_KEY` set | Azure AI Foundry → `ChatAnthropic` |
 | 2 | fallback | OpenAI → `ChatOpenAI` (`gpt-4o`) |
 
-**Embeddings** — Claude has no embedding model, so:
+**Embeddings** — Claude has no embedding model:
 | Priority | Condition | Provider |
 |---|---|---|
 | 1 | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` set | `AzureOpenAIEmbeddings` |
 | 2 | fallback | `OpenAIEmbeddings` (`text-embedding-3-large`) |
 
-Azure AI Foundry base URL is auto-derived: `https://{ANTHROPIC_FOUNDRY_RESOURCE}.services.ai.azure.com/anthropic`
+Azure Foundry base URL auto-derived: `https://{ANTHROPIC_FOUNDRY_RESOURCE}.services.ai.azure.com/anthropic`
 
-### Key Hardcoded Values
+### MCP Integration
 
-- Hybrid retrieval weights: `[0.35, 0.65]` (BM25/vector) — tunable per domain
-- Vector DB persist directory: `data/rag_db/`
-- Web search: uses Tavily if `TAVILY_API_KEY` is set, otherwise DuckDuckGo (free, no key needed)
-- SQL: any SQLAlchemy-compatible DB via `SQL_CONNECTION_STRING` env var
+Two separate MCP roles:
 
-### Data Sources & Tools
+**Query-time retrieval** (`src/datasources/mcp_source.py`):
+- `async fetch_mcp_documents(query)` called from `api/routers/query.py` before graph invocation
+- Connects to Foundry, calls each tool with `{"query": query}`, returns results as Documents
+- Docs seeded into initial `RAGState.documents` and merged with vector results in `retrieve_node`
 
-`src/datasources/` provides pluggable connectors with a shared registry:
-```python
-from src.datasources import load_from_source
-docs = load_from_source("sql_server", connection_string="...", table="products")
-docs = load_from_source("filesystem", directory="./source")
-docs = load_from_source("web", urls=["https://..."])
-```
-New sources are added by subclassing `BaseDataSource` and registering in `REGISTRY`.
+**Standalone agent** (`src/mcp/server.py`):
+- Full agentic loop: sends query → handles `tool_use` → calls `session.call_tool()` → feeds results back → repeats until `end_turn`
+- `ANTHROPIC_API_KEY` falls back to `ANTHROPIC_FOUNDRY_API_KEY`; routes through Azure when `ANTHROPIC_FOUNDRY_BASE_URL` is set
 
-`src/tools/` provides LangChain tools for the graph's web search fallback and SQL querying. `get_sql_tools()` returns empty list if `SQL_CONNECTION_STRING` is unset.
+### Key Constants (all in `src/config.py`)
 
-### MCP Agent
-
-`src/mcp/server.py` is an **MCP client** (not a server) that connects to the Dubai Holding Foundry remote MCP endpoint via `streamablehttp_client`. It:
-1. Authenticates with `FOUNDRY_TOKEN` Bearer header
-2. Fetches available tools from the remote endpoint via `session.list_tools()`
-3. Passes them to `AsyncAnthropic.messages.create()` so Claude can invoke them
-
-`ANTHROPIC_API_KEY` auto-falls back to `ANTHROPIC_FOUNDRY_API_KEY` if not separately set. When `ANTHROPIC_FOUNDRY_BASE_URL` is configured, the `AsyncAnthropic` client routes through Azure AI Foundry instead of `api.anthropic.com`.
-
-Required env vars: `FOUNDRY_TOKEN`, `ANTHROPIC_FOUNDRY_API_KEY` (or `ANTHROPIC_API_KEY`). `MCP_SERVER_URL` defaults to the Dubai Holding Foundry endpoint and can be overridden.
+| Constant | Value |
+|---|---|
+| Hybrid weights | `[0.35, 0.65]` (BM25 / vector) |
+| Chunk size / overlap | `512` / `50` |
+| Semantic breakpoint | 90th percentile |
+| Reranker top-N | `5` |
+| Final top-K | `6` |
+| Max retries (each budget) | `2` |
 
 ### IDE Import Warnings
 
-Pylance will show "Import could not be resolved" for `langchain_*` and `fastapi`. This is a false positive — packages are installed in `.venv`. Point Pylance to the interpreter at `.venv/bin/python` to suppress. All imports are verified to work at runtime.
+Pylance shows "Import could not be resolved" for `langchain_*`, `fastapi`, `mcp`. False positives — packages are in `.venv`. Set Pylance interpreter to `.venv/bin/python`.
 
 ### Package Import Notes
-
-In the installed version of LangChain, several classes have moved from their original locations:
 
 | Class | Correct import |
 |---|---|

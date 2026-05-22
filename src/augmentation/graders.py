@@ -1,6 +1,6 @@
 from langchain_core.documents import Document
 
-from src.llm import llm
+from src.llm import llm_with_retry as llm
 
 
 def grade_documents(query: str, docs: list[Document]) -> list[Document]:

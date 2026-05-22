@@ -10,8 +10,11 @@ from src.tools.web_search import search_to_documents
 
 def make_retrieve_node(retrieval: RetrievalPipeline):
     def retrieve_node(state: RAGState) -> dict:
-        docs = retrieval.retrieve(state["query"])
-        return {"documents": docs}
+        vector_docs = retrieval.retrieve(state["query"])
+        # Merge with any docs pre-seeded in state (e.g. from MCP fetch in the router)
+        combined = list(state.get("documents") or []) + vector_docs
+        print(f"[Retrieval] {len(state.get('documents') or [])} MCP + {len(vector_docs)} vector = {len(combined)} total docs")
+        return {"documents": combined}
     return retrieve_node
 
 

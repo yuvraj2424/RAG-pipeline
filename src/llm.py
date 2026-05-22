@@ -90,6 +90,23 @@ def get_embeddings() -> Embeddings:
     return OpenAIEmbeddings(model=EMBEDDING_MODEL)
 
 
-# Module-level instances used throughout the codebase
-llm        = get_llm()
+# Transient errors from Azure AI Foundry that warrant a retry
+try:
+    from anthropic import OverloadedError as _OverloadedError
+    from anthropic import InternalServerError as _InternalServerError
+    _RETRY_EXCEPTIONS = (_OverloadedError, _InternalServerError)
+except ImportError:
+    from anthropic import APIStatusError as _APIStatusError
+    _RETRY_EXCEPTIONS = (_APIStatusError,)
+
+# Module-level instances used throughout the codebase.
+# `llm` is the raw instance — use it when you need .with_structured_output().
+# `llm_with_retry` wraps invoke() with exponential backoff for transient
+# 529 "Overloaded" errors from Azure AI Foundry (up to 3 attempts).
+llm = get_llm()
+llm_with_retry = llm.with_retry(
+    retry_if_exception_type=_RETRY_EXCEPTIONS,
+    wait_exponential_jitter=True,
+    stop_after_attempt=3,
+)
 embeddings = get_embeddings()

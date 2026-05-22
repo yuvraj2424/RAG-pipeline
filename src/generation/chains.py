@@ -1,10 +1,14 @@
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from src.generation.schemas import RAGAnswer, RAG_SYSTEM
-from src.llm import llm
+from src.llm import llm, llm_with_retry, _RETRY_EXCEPTIONS
 
-# Structured output — derived from the shared module-level LLM instance
-_structured_llm = llm.with_structured_output(RAGAnswer)
+# Structured output with retry — chain: structured_output → retry wrapper
+_structured_llm = llm.with_structured_output(RAGAnswer).with_retry(
+    retry_if_exception_type=_RETRY_EXCEPTIONS,
+    wait_exponential_jitter=True,
+    stop_after_attempt=3,
+)
 
 
 def generate(query: str, context: str, chat_history: list | None = None) -> RAGAnswer:
@@ -40,7 +44,7 @@ Answer generated:
 
 Is every factual claim in the answer directly supported by the context above?
 Reply ONLY: "faithful" or "hallucinated" """
-    result = llm.invoke(faith_prompt).content.strip().lower()
+    result = llm_with_retry.invoke(faith_prompt).content.strip().lower()
     faithful = "faithful" in result and "hallucinated" not in result
     print(f"[Generation] Faithfulness check: {'PASS' if faithful else 'FAIL'}")
     return faithful
