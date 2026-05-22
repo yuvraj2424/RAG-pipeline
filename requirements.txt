@@ -1,0 +1,38 @@
+# LangChain ecosystem
+langchain
+langchain-core
+langchain-openai
+langchain-anthropic
+langchain-community
+langchain-experimental
+langchain-text-splitters
+langchain-classic
+langgraph
+
+# Vector store & retrieval
+chromadb
+rank-bm25
+flashrank
+cohere
+
+# API
+fastapi
+uvicorn[standard]
+pydantic
+
+# Data sources
+sqlalchemy
+pyodbc
+duckduckgo-search
+
+# MCP client
+mcp
+
+# Azure AI Foundry / Claude
+anthropic
+
+# Evaluation
+ragas
+
+# Misc
+python-dotenv
